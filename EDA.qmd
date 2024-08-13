@@ -1,0 +1,661 @@
+---
+title: "Exploratory Data Analysis of the Claims Data Set"
+format: html
+editor: visual
+code-overflow: wrap
+code-fold: false
+code-summary: "Code"
+---
+
+An EDA walk through consisting of importing, cleaning, and exploring the claims data.
+
+## Libraries
+
+```{r message=FALSE, output=FALSE, warning=FALSE}
+
+library(tidyverse) # contains dplyr, tidyr, ggplot2, lubridate; among others
+library(janitor)
+library(healthyR.ts)
+library(cowplot)
+
+```
+
+## Importing the Data
+
+```{r warning=FALSE}
+
+f_path <- "C:/Users/cdelaney/OneDrive - stonybrookmedicine/Documents/claims_data.csv"
+claims_raw <- read.table(file = f_path, sep = ",", header = TRUE) |>
+  clean_names()
+  ## clean_names() formats all variable names to lowercase
+  ## |> is the built in function for %>%
+
+## Make a copy of the claims_raw data set
+
+claims <- claims_raw
+
+```
+
+## Data Cleaning
+
+Replace all "NULL" character values with NA:
+
+```{r}
+
+claims[claims == "NULL"] <- NA
+
+```
+
+**Removing Unnecessary Variables**
+
+```{r}
+
+## Vector containing the variables to be removed, with explanations for each variable
+
+columns_to_remove <- c(
+  "patient_account_number",     # unique patient identifier
+  "pt_no",                      # unique patient account number
+  "unit_no",                    # NA for all accounts
+  "inst",                       # unique claim number
+  "medical_record_number",      # unique MRN for each patient
+  "attending_phys_id",          # too many unique IDs
+  "rendering_provider_id",      # too many unique IDs 
+  "number",                     # same thing as billing_npi
+  "parent_name",                # the same for all but 92 data points
+  "inst_rev_code_v",            # used to join revenue code vars in SQL
+  "inst_line_procedure_code_v", # used to join procedure code vars in SQL
+  "info_code_qualifier",        # all rows except one have the same value
+  "inst_info_code",             # every claim has a unique inst_info_code
+  "billing_npi"                 # all but 85 claims have the same billing_npi
+)
+
+## Removing the variables
+
+claims <- claims[,-which(names(claims) %in% columns_to_remove)]
+
+```
+
+**Revenue Codes:** The revenue code variables consist of the total amount charged per revenue code, so this must be a numeric value.
+
+```{r}
+
+## List of all revenue code variables
+
+rev_code_column_names <- list()
+for (i in colnames(claims)) {
+  if (substr(i, start = 1, stop = 7) == "rev_cd_")
+  rev_code_column_names <- append(rev_code_column_names, list(i))
+}
+rev_code_column_names <- unlist(rev_code_column_names, use.names = FALSE)
+
+## Convert the revenue code variables to numeric
+
+claims <- claims %>% mutate_at(rev_code_column_names, as.numeric)
+
+```
+
+**Numeric → Character:** These variables consist of IDs, account numbers, and claim numbers. They are not numeric values.
+
+```{r}
+
+## List of all variables to be changed from numeric to character
+
+to_character_column_names <- c(
+  "facility_type_code", "frequency_code", "admission_type_code", "patient_status_code")
+
+## Convert the numeric variables to character
+
+claims <- claims %>% mutate_at(to_character_column_names, as.character)
+
+```
+
+**Dates:** The date variables are classified as characters, so they must be changed to dates in order to complete an effective EDA and model.
+
+```{r}
+
+## Convert the date variables to dates
+
+claims$file_creation_date <- as.Date(claims$file_creation_date, "%m/%d/%Y")
+claims$statement_from_date <- as.Date(claims$statement_from_date, "%m/%d/%Y")
+
+```
+
+## EDA
+
+### Claim Status Count
+
+-   **Approved**: Claims that were fully processed by Anthem.
+-   **Denied**: Claims that were denied.
+-   **Unknown**: Claims that still under review, but Stony Brook has received a response. For example, Anthem may request to see further medical records and documentation for the patient before approving/denying a claim. Or, a claim that sent as a reversal for a previous payment that Stony Brook Medicine deemed as unwarranted.
+-   **NA**: Claims that have neither been approved, denied, nor received any notification from Anthem yet.
+
+```{r}
+#| code-fold: true
+
+## Data frame of each claim status and its count
+
+cs_counts <- claims %>%
+  group_by(claim_status) %>%
+  summarise(status_count = n()) %>%
+  arrange(desc(status_count))
+
+## Bar graph
+
+ggplot(data = cs_counts, aes(x = claim_status, y = status_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_label(aes(label = status_count)) +
+  xlab("Claim Status") +
+  scale_y_continuous(name = "Count", labels = scales::comma) +
+  ggtitle("Count of Claim Status") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+```
+
+Claims that have a claim status of **Unknown** or **NA** will be removed in order to only analyze claims that have a definitive outcome.
+
+```{r}
+
+## Remove rows with claim_status = Unknown or NA
+
+claims <- claims %>%
+  filter(claim_status == "Approved" | claim_status == "Denied")
+
+## Converting claim_status to a factor
+
+claims$claim_status <- as.factor(claims$claim_status)
+
+```
+
+### Distribution of Claims by the Sent Date
+
+Before moving further, it's important to see the distribution of the number of claims that were sent for different time periods. That way it will be easier to explain any analysis that appears to be skewed when visualizing denial rates and other metrics by date later on.
+
+**Weekday Distribution**
+
+```{r}
+#| code-fold: true
+
+## Copy of claims data set; adding the weekday, month, day number of the year, and week number of the year
+
+claims <- claims %>%
+  mutate(weekday = lubridate::wday(file_creation_date, label = T, week_start = 7),
+         month = lubridate::month(file_creation_date, label = T),
+         day = lubridate::yday(file_creation_date),
+         week = lubridate::epiweek(file_creation_date),
+         year = lubridate::year(file_creation_date))
+
+## epiweek makes the last week of the year as week 1, so need to change that to week 53 for the plot
+
+claims$week[claims$month == "Dec" & claims$week == 1] = 53
+
+## Add the week of the month
+
+claims <- claims %>% 
+  group_by(month) %>% 
+  mutate(monthweek = 1 + week - min(week))
+
+## Distribution of claims sent by weekday
+
+round(prop.table(table(claims[["weekday"]])) * 100, 2)
+
+```
+
+Claims are not supposed to be generated and sent during the weekends. However, 0.15% of claims in the data were sent on the weekends. In fact, in the entire 6 year span, claims were sent on only a single Sunday and 12 different Saturdays. All claims that were sent on Saturday and Sunday will be removed from the data to avoid issues and inconsistencies during further analysis.
+
+**Monthly Distribution**
+
+```{r}
+#| code-fold: true
+
+## Distribution of claims sent by month
+
+round(prop.table(table(claims[["month"]])) * 100, 2)
+
+```
+
+Consistent distribution per month.
+
+**Yearly Distribution**
+
+```{r}
+#| code-fold: true
+
+## Distribution of claims sent by year
+
+round(prop.table(table(claims[["year"]])) * 100, 2)
+
+```
+
+Data from 2017 will be removed as it only accounts for 0.29% of claims.
+
+```{r}
+
+## Remove data with weekday = Sat or Sun as well as year = 2017
+
+claims <- claims %>%
+  filter(weekday != "Sat" & weekday != "Sun" & year != 2017)
+
+```
+
+### Time Series Visualization of Claim Status Count
+
+Data from the last month of the data set, June 2024, will be removed from the cs_month_counts data frame for the purposes of visualization. This is because these months don't contain a full month's worth of data, so the monthly metrics are outliers. Claims that are sent in this month will not be excluded from the overall claims data set.
+
+```{r message=FALSE}
+#| code-fold: true
+
+## Data frame of each file_creation_date month mapped to each claim status and the number of occurrences for claims sent that month
+
+cs_month_counts <- claims %>%
+  group_by(month_sent = lubridate::floor_date(file_creation_date, "month"), claim_status) %>%
+  summarise(status_count = n()) %>%
+  arrange(month_sent)
+
+## Remove first and last months
+
+cs_month_counts <- cs_month_counts %>%
+  filter(month_sent != "2017-12-01" & month_sent != "2024-06-01")
+
+## Line graph
+
+ggplot(cs_month_counts, aes(x = month_sent, y = status_count, color = claim_status)) +
+  geom_line() +
+  scale_x_date(name = "Month the Claim was Sent", date_breaks = "12 months", date_labels = "%b-%Y") +
+  scale_y_continuous(name = "Count", labels = scales::comma) +
+  labs(color = "Claim Status") +
+  ggtitle("Count of Claim Status Over Time") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+We can see that there are several spikes in the number of claims approved, however further analysis must be done to see how that compares to the overall denial rate.
+
+-   x-axis: month that the claim was sent to Anthem
+-   y-axis: count of the claim status
+
+### Denial Rate
+
+Denial rate is defined as the proportion of denials out of the total number of claim outcomes. For example, if 100 claims are sent on Monday, and 10 are denied, the denial rate is 10%.
+
+```{r}
+#| code-fold: true
+
+## Data frame of each month and the count of each claim outcome for all claims sent that month pivoted
+
+cs_month_pivot <- cs_month_counts %>%
+  pivot_wider(
+    names_from = claim_status,
+    values_from = status_count,
+    values_fill = 0
+  ) %>%
+  clean_names()
+
+## Adding total outcomes and denial rate variables
+
+cs_month_pivot$total_outcomes<- rowSums(cs_month_pivot[,2:3])
+cs_month_pivot$denial_rate <- round(((cs_month_pivot$denied / cs_month_pivot$total_outcomes) * 100), 2)
+
+## Line graph
+
+ggplot(cs_month_pivot, aes(x = month_sent, y = denial_rate)) +
+  geom_line(aes(group = 1), color = "steelblue") +
+  scale_x_date(name = "Month the Claim was Sent", date_breaks = "12 months", date_labels = "%b-%Y") +
+  scale_y_continuous(name = "Denial Rate (%)") +
+  ggtitle("Denial Rate Over Time") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+The denial rate has been steadily increasing over time. There was a large spike around March 2020, which corresponds to the onset of Covid-19. Perhaps this could explain that spike.
+
+-   x-axis: month that the claim was sent to Anthem
+-   y-axis: denial rate
+
+### Calendar Denial Rate Heat Map
+
+We saw how denial rate has trended over time, however it's important to break it down further to try and identify key time periods of higher rates that may not be seen as easily from above.
+
+```{r message=FALSE, warning=FALSE}
+#| code-fold: true
+
+## Data frame of each sent date day mapped to each claim status and the number of occurrences for claims sent that day
+
+date_metrics <- claims %>%
+  group_by(sent_date = file_creation_date, claim_status) %>%
+  summarise(status_count = n()) %>%
+  arrange(sent_date)
+
+## Data frame of each day and the count of each claim outcome for all claims sent that day; pivoted out by claim status
+
+date_metrics <- date_metrics %>%
+  pivot_wider(
+    names_from = claim_status,
+    values_from = status_count,
+    values_fill = 0
+  ) %>%
+  clean_names()
+
+## Adding total outcomes and denial rate variables
+
+date_metrics$total_outcomes<- rowSums(date_metrics[,2:3])
+date_metrics$denial_rate <- round(((date_metrics$denied / date_metrics$total_outcomes) * 100), 2)
+
+## Add the weekday, month, day number of the year, and week number of the year
+
+date_metrics <- date_metrics %>%
+  mutate(weekday = lubridate::wday(sent_date, label = T, week_start = 7),
+         month = lubridate::month(sent_date, label = T),
+         day = lubridate::yday(sent_date),
+         week = lubridate::epiweek(sent_date),
+         year = lubridate::year(sent_date))
+
+
+## epiweek makes the last week of the year as week 1, so need to change that to week 53 for the plot
+
+date_metrics$week[date_metrics$month == "Dec" & date_metrics$week == 1] = 53
+
+## Add the week of the month
+
+date_metrics <- date_metrics %>% 
+  group_by(month) %>% 
+  mutate(monthweek = 1 + week - min(week))
+
+## Calendar heat map of denial rates
+
+ts_calendar_heatmap_plot(
+  .data = date_metrics,
+  .date_col = sent_date,
+  .value_col = denial_rate,
+  .low = "green",
+  .high = "red",
+  .interactive = FALSE
+)
+
+```
+
+The highest denial rates occurred mostly in claims that were sent to Anthem in January 2020. Could this have something to do with Covid? Due to the large range for denial rate, it's difficult to see any trends that may be occurring for rates in the bottom half of the range.
+
+Let's see how the heat map would look excluding rates above 25%. Only 1.96% of 1,630 dates have a denial rate greater than 25%.
+
+```{r}
+#| code-fold: true
+
+## Filtered data frame of dates with denial rates below 30%
+
+date_metrics_filtered <- date_metrics %>%
+  filter(denial_rate <= 25)
+
+## Calendar heat map of denial rates below 30%
+
+ts_calendar_heatmap_plot(
+  .data = date_metrics_filtered,
+  .date_col = sent_date,
+  .value_col = denial_rate,
+  .low = "green",
+  .high = "red",
+  .interactive = FALSE
+)
+```
+
+This calendar shows that denial rates have generally been increasing as time has gone on. The colors seem to shade more towards orange and red in the later years. It also further validates the Denial Rate Over Time line graph from before.
+
+### Average Denial Rates
+
+Visualizing the average denial rate by different time periods.
+
+**Weekday**
+
+```{r}
+#| code-fold: true
+
+## Average denial rate data frame - Weekday
+
+date_metrics_weekday <- date_metrics %>%
+  group_by(weekday) %>%
+  summarise(avg_denial_rate = round(mean(denial_rate), 2)) %>%
+  arrange(weekday)
+
+date_metrics_weekday
+
+## Plot - Weekday
+
+ggplot(data = date_metrics_weekday, aes(x = weekday, y = avg_denial_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.6) +
+  xlab("Weekday the Claim was Sent") +
+  scale_y_continuous(name = "Avg. Denial Rate (%)", labels = scales::comma) +
+  ggtitle("Average Denial Rate by Weekday") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+There is a v-shaped pattern when going from Monday-Friday. Denial rate trends down in the beginning of the week and then peaks at the end.
+
+**Monthly**
+
+```{r}
+#| code-fold: true
+
+## Average denial rate data frame - Month
+
+date_metrics_month <- date_metrics %>%
+  group_by(month) %>%
+  summarise(avg_denial_rate = round(mean(denial_rate), 2)) %>%
+  arrange(month)
+
+date_metrics_month
+
+## Plot - Month
+
+ggplot(data = date_metrics_month, aes(x = month, y = avg_denial_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.6) +
+  xlab("Month the Claim was Sent") +
+  scale_y_continuous(name = "Avg. Denial Rate (%)", labels = scales::comma) +
+  ggtitle("Average Denial Rate by Month") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+January has the highest average denial rate, and from February to December there appears to be a cyclical pattern.
+
+**Yearly**
+
+```{r}
+#| code-fold: true
+
+## Average denial rate data frame - Year
+
+date_metrics_year <- date_metrics %>%
+  group_by(year) %>%
+  summarise(avg_denial_rate = round(mean(denial_rate), 2)) %>%
+  arrange(year)
+
+date_metrics_year
+
+## Plot - Year
+
+ggplot(data = date_metrics_year, aes(x = year, y = avg_denial_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue", width = 0.6) +
+  xlab("Year the Claim was Sent") +
+  scale_y_continuous(name = "Avg. Denial Rate (%)", labels = scales::comma) +
+  ggtitle("Average Denial Rate by Year") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+Average denial rate has mostly increased year after year, with a peak in 2020. However it is decreasing since 2022, although it should be noted that 2024 data is only until June.
+
+### Revenue Codes
+
+Looking at revenue code occurrences and amounts billed.
+
+```{r}
+#| code-fold: true
+
+## Revenue code base data frame - just a data frame of revenue code columns from claims
+
+rev_code_df <- claims %>%
+  ungroup() %>%
+  select(starts_with("rev_cd_"))
+
+## Changing NA values to 0
+
+rev_code_df[is.na(rev_code_df)] <- 0
+
+## Sum and count of each revenue code
+
+rev_code_totals <- rev_code_df %>%
+  pivot_longer(cols = everything(), names_to = "rev_code", values_to = "total") %>%
+  group_by(rev_code) %>%
+  summarise(billed_amount = sum(total),         # total amount billed for each revenue code across all claims
+            distinct_claims = sum(total != 0))  # number of claims that billed each revenue code
+
+## Adding avg_billed variable: billed_amount / distinct_claims
+
+rev_code_totals$avg_billed <- rev_code_totals$billed_amount / rev_code_totals$distinct_claims
+
+## Distribution of revenue code vs. totals
+
+rev_code_totals$pct_of_total_billed <- round(((rev_code_totals$billed_amount / sum(rev_code_totals$billed_amount)) * 100), 6)
+rev_code_totals$pct_of_distinct_claims <- round(((rev_code_totals$distinct_claims / sum(rev_code_totals$distinct_claims)) * 100), 6)
+
+## Remove rev_cd_ from the start of each revenue code
+
+rev_code_totals <- rev_code_totals %>%
+  mutate(rev_code = substr(rev_code, 8, 11))
+
+## Top 10 revenue codes per billed_amount
+
+rev_code_t10_total_billed <- top_n(rev_code_totals, 10, billed_amount)
+
+rc1 <- ggplot(data = rev_code_t10_total_billed, aes(x = reorder(rev_code, -billed_amount), y = billed_amount)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  xlab("Revenue Code") +
+  scale_y_continuous(name = "Total Billed ($)", labels = scales::comma) +
+  ggtitle("Top 10 Billed Amounts") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## Top 10 revenue codes per distinct_claims
+
+rev_code_t10_distinct_claims <- top_n(rev_code_totals, 10, distinct_claims)
+
+rc2 <- ggplot(data = rev_code_t10_distinct_claims, aes(x = reorder(rev_code, -distinct_claims), y = distinct_claims)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  xlab("Revenue Code") +
+  scale_y_continuous(name = "Occurrences", labels = scales::comma) +
+  ggtitle("Top 10 Codes on Distinct Claims") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## Top 10 revenue codes per avg_billed
+
+rev_code_t10_avg_billed <- top_n(rev_code_totals, 10, avg_billed)
+
+rc3 <- ggplot(data = rev_code_t10_avg_billed, aes(x = reorder(rev_code, -avg_billed), y = avg_billed)) +
+  geom_bar(stat = "identity", fill = "orange") +
+  xlab("Revenue Code") +
+  scale_y_continuous(name = "Avg. Billed ($)", labels = scales::comma) +
+  ggtitle("Top 10 Avg. Billed Amount") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## Plot of the three bar plots
+
+plot_grid(rc1, rc2, rc3, ncol = 2, nrow = 2)
+
+```
+
+-   **Top 10 Billed Amounts:** The 10 revenue codes that had the highest total amount billed across all claims.
+-   **Top 10 Codes on Distinct Claims:** The 10 revenue codes that appeared on the most claims.
+-   **Top 10 Avg. Billed Amount:** The 10 revenue codes that had the highest average amount billed per claim.
+
+**Distribution of Total Amount Billed and Total Times on Claims**
+
+Looking at how much of the total amount billed and times on claims across all revenue codes the top 10 revenue codes account for.
+
+```{r}
+#| code-fold: true
+
+## Distribution of top 10 pct_of_total_billed
+
+select(rev_code_t10_total_billed, rev_code, pct_of_total_billed) %>%
+  arrange(desc(pct_of_total_billed))
+
+## Distribution of top 10 pct_of_distinct_claims
+
+select(rev_code_t10_distinct_claims, rev_code, pct_of_distinct_claims) %>%
+  arrange(desc(pct_of_distinct_claims))
+
+```
+
+### Procedure Codes
+
+Looking at procedure code occurrences.
+
+```{r}
+#| code-fold: true
+
+## Procedure (px) code base data frame - just a data frame of procedure code columns from claims
+
+px_code_df <- claims %>%
+  ungroup() %>%
+  select(starts_with("px_cd_"))
+
+## Sum and count of each px code
+
+px_code_totals <- px_code_df %>%
+  pivot_longer(cols = everything(), names_to = "px_code", values_to = "total") %>%
+  group_by(px_code) %>%
+  summarise(total_count = sum(total),                     # total occurrences for each px code across all claims
+            distinct_claims = sum(total != 0),            # number of claims that billed each px code
+            difference = (sum(total) - sum(total != 0)))  # claims where the px code appeared more than once
+
+## Remove px_cd_ from the start of each px code
+
+px_code_totals <- px_code_totals %>%
+  mutate(px_code = substr(px_code, 7, 12))
+
+## Change lowercase letters in px_codes to uppercase
+
+px_code_totals$px_code <- toupper(px_code_totals$px_code)
+
+## Top 10 px codes per distinct_claims
+
+px_code_t10_distinct_claims <- top_n(px_code_totals, 11, distinct_claims)
+px_code_t10_distinct_claims <- px_code_t10_distinct_claims[px_code_t10_distinct_claims$px_code != "OTHER",]
+
+pc1 <- ggplot(data = px_code_t10_distinct_claims, aes(x = reorder(px_code, -distinct_claims), y = distinct_claims)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  xlab("Procedure Code") +
+  scale_y_continuous(name = "Count", labels = scales::comma) +
+  ggtitle("Top 10 Codes on Distinct Claims") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## Top 10 px codes per difference in total count vs. distinct claims
+
+px_code_t10_differences <- top_n(px_code_totals, 11, difference)
+px_code_t10_differences <- px_code_t10_differences[px_code_t10_differences$px_code != "OTHER",]
+
+pc2 <- ggplot(data = px_code_t10_differences, aes(x = reorder(px_code, -difference), y = difference)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  xlab("Procedure Code") +
+  scale_y_continuous(name = "Count", labels = scales::comma) +
+  ggtitle("Top 10 Codes on Claims more than once") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+## Plot of the two bar plots
+
+plot_grid(pc1, pc2, ncol = 1, nrow = 2)
+
+```
+
+-   **Top 10 Codes on Distinct Claims:** The 10 procedure codes that appeared on the most claims.
+-   **Top 10 Codes on Claims more than once:** Procedure codes can appear on a claim more than once. This plot illustrates the procedure codes that appeared more than once the most.

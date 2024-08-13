@@ -1,0 +1,639 @@
+---
+title: "Modeling"
+format: html
+editor: visual
+code-overflow: wrap
+code-fold: false
+code-summary: "Code"
+---
+
+Modeling the claims data.
+
+## Libraries
+
+```{r message=FALSE, output=FALSE, warning=FALSE}
+
+library(modelsummary)
+library(tidyverse) # contains dplyr, tidyr, ggplot2, lubridate; among others
+library(janitor)
+library(caret)
+library(car)
+library(e1071)
+library(Metrics)
+
+```
+
+## Importing the Data
+
+```{r warning=FALSE}
+
+## Read in the data set; clean_names() formats all variable names as lowercase
+
+f_path <- "C:/Users/cdelaney/OneDrive - stonybrookmedicine/Documents/claims_data.csv"
+claims_raw <- read.table(file = f_path, sep = ",", header = TRUE) |>
+  clean_names()
+
+## Make a copy of the claims_raw data set
+
+claims <- claims_raw
+
+## Move the y variable, claim_status, to the first column
+
+claims <- claims %>%
+  relocate(claim_status)
+
+```
+
+## Data Cleaning
+
+**Removing Unnecessary Variables**
+
+```{r}
+#| code-fold: true
+
+## Vector containing the variables to be removed, with explanations for each variable
+
+columns_to_remove <- c(
+  "patient_account_number",     # unique patient identifier
+  "pt_no",                      # unique patient account number
+  "unit_no",                    # NA for all accounts
+  "inst",                       # unique claim number
+  "medical_record_number",      # unique MRN for each patient
+  "attending_phys_id",          # too many unique IDs
+  "rendering_provider_id",      # too many unique IDs 
+  "number",                     # same thing as billing_npi
+  "parent_name",                # the same for all but 92 data points
+  "inst_rev_code_v",            # used to join revenue code vars in SQL
+  "inst_line_procedure_code_v", # used to join procedure code vars in SQL
+  "info_code",                  # identifies a line on a claim; category
+  "info_code_qualifier",        # all rows except one have the same value
+  "inst_info_code",             # every claim has a unique inst_info_code
+  "billing_npi"                 # all but 85 claims have the same billing_npi
+)
+
+## Removing the variables
+
+claims <- claims[,-which(names(claims) %in% columns_to_remove)]
+
+```
+
+**Numeric → Character:** These variables consist of IDs, account numbers, and claim numbers. They are not numeric values.
+
+```{r}
+#| code-fold: true
+
+## List of all variables to be changed from numeric to character
+
+to_character_column_names <- c(
+  "facility_type_code", "frequency_code", "admission_type_code", "patient_status_code")
+
+## Convert the numeric variables to character
+
+claims <- claims %>% mutate_at(to_character_column_names, as.character)
+
+```
+
+**Dates:** The date variables are classified as characters, so they must be changed to dates in order to complete an effective EDA and model.
+
+```{r}
+#| code-fold: true
+
+## Convert the date variables to dates
+
+claims$file_creation_date <- as.Date(claims$file_creation_date, "%m/%d/%Y")
+claims$statement_from_date <- as.Date(claims$statement_from_date, "%m/%d/%Y")
+
+```
+
+Adding in variables to get the weekday, month, day of the year, week of the year, and year a claim was sent. Claims sent on Saturday, Sunday, or in 2017 will be removed.
+
+```{r}
+#| code-fold: true
+
+## Copy of claims data set; adding the weekday, month, day number of the year, and week number of the year
+
+claims <- claims %>%
+  mutate(weekday_sent = lubridate::wday(file_creation_date, label = T, week_start = 7),
+         month_sent = lubridate::month(file_creation_date, label = T),
+         day_sent = lubridate::yday(file_creation_date),
+         week_sent = lubridate::epiweek(file_creation_date),
+         year_sent = lubridate::year(file_creation_date))
+
+## epiweek makes the last week of the year as week 1, so need to change that to week 53 for the plot
+
+claims$week_sent[claims$month_sent == "Dec" & claims$week_sent == 1] = 53
+
+## Remove data with weekday = Sat or Sun as well as year = 2017
+
+claims <- claims %>%
+  filter(weekday_sent != "Sat" & weekday_sent != "Sun" & year_sent != 2017)
+
+## Update weekday and month to character from factor
+
+claims$weekday_sent <- as.character(claims$weekday_sent)
+claims$month_sent <- as.character(claims$month_sent)
+
+```
+
+Claims that have a claim status of **Unknown** or **NA** will be removed in order to only analyze claims that have a definitive outcome.
+
+```{r}
+#| code-fold: true
+
+## Remove rows with claim_status = Unknown or NA
+
+claims <- claims %>%
+  filter(claim_status == "Approved" | claim_status == "Denied")
+
+## Converting claim_status to a factor
+
+claims$claim_status <- as.factor(claims$claim_status)
+
+```
+
+**Revenue Codes**
+
+The revenue code variables consist of the total amount charged per revenue code, so this must be a numeric value.
+
+```{r warning=FALSE}
+#| code-fold: true
+
+## List of all revenue code variables
+
+rev_code_column_names <- list()
+for (i in colnames(claims)) {
+  if (substr(i, start = 1, stop = 7) == "rev_cd_")
+  rev_code_column_names <- append(rev_code_column_names, list(i))
+}
+rev_code_column_names <- unlist(rev_code_column_names, use.names = FALSE)
+
+## Convert the revenue code variables to numeric
+
+claims <- claims %>% mutate_at(rev_code_column_names, as.numeric)
+
+# Convert NA rev_code values to 0
+
+claims[is.na(claims)] <- 0
+
+```
+
+Getting the top 10 revenue codes by the number of claims they have a non-zero amount billed, or in other words, the number of claims that they appear on. The bottom 110 revenue code columns will be removed from the data. This is done in order to reduce the complexity of the model. Many revenue codes appear on less than 0.5% of claims.
+
+```{r}
+#| code-fold: true
+
+## Revenue code base data frame - just a data frame of revenue code columns from claims
+
+rev_code_df <- claims %>%
+  ungroup() %>%
+  select(starts_with("rev_cd_"))
+
+## Count of the number of claims the revenue code appears on - Bottom 110 counts
+
+rev_code_df <- rev_code_df %>%
+  pivot_longer(cols = everything(), names_to = "rev_code", values_to = "total") %>%
+  group_by(rev_code) %>%
+  summarise(occurrences = sum(total != 0)) %>%
+  top_n(-110, occurrences)
+
+## Removing the bottom 100 count revenue codes from the data
+
+bottom_n_rev_codes <- c(rev_code_df$rev_code)
+
+claims <- claims[,!(names(claims) %in% bottom_n_rev_codes)]
+
+```
+
+**Procedure Codes**
+
+Getting the top 10 procedure codes by the number of claims that they appear on. The bottom 90 procedure code columns will be removed from the data. This is done in order to reduce the complexity of the model.
+
+```{r}
+#| code-fold: true
+
+## Procedure (px) code base data frame - just a data frame of procedure code columns from claims
+
+claims <- claims[,!(names(claims) %in% c("px_cd_other"))]
+
+px_code_df <- claims %>%
+  ungroup() %>%
+  select(starts_with("px_cd_"))
+
+## Count of the number of claims the procedure code appears on - Bottom 110 counts
+
+px_code_df <- px_code_df %>%
+  pivot_longer(cols = everything(), names_to = "px_code", values_to = "total") %>%
+  group_by(px_code) %>%
+  summarise(occurrences = sum(total != 0)) %>%
+  top_n(-90, occurrences)
+
+## Removing the bottom 90 count procedure codes from the data
+
+bottom_n_px_codes <- c(px_code_df$px_code)
+
+claims <- claims[,!(names(claims) %in% bottom_n_px_codes)]
+
+```
+
+**Zip Codes**
+
+Over half of the claims had a patient zip code of NULL and only 14 of the remaining 2,457 unique zips had a distribution of over 1%. This lead to the removal of the variable.
+
+```{r}
+#| code-fold: true
+
+## Distribution of zip codes
+
+zip_code_df <- as.data.frame(prop.table(table(claims[["subscriber_zip"]])) * 100)
+
+zip_code_df <- zip_code_df %>%
+  arrange(desc(Freq)) %>%
+  rename(subscriber_zip = Var1)
+
+head(zip_code_df)
+
+## Removing subscriber_zip
+
+claims <- claims[,!(names(claims) %in% c("subscriber_zip"))]
+
+```
+
+**Patient Gender**
+
+Over half of the claims had a patient gender of NULL. This lead to the removal of the variable.
+
+```{r}
+#| code-fold: true
+
+## Distribution of patient gender
+
+round(prop.table(table(claims[["subscriber_gender"]])) * 100, 2)
+
+## Removing subscriber_gender
+
+claims <- claims[,!(names(claims) %in% c("subscriber_gender"))]
+
+```
+
+**Operating Physician**
+
+Almost 80% of claims had an NA value for operating_phys_id. This indicates that they did not have surgery. Claims with an NA value for operating_phys_id will be updated to 0, and those with a value will have a value of 1.
+
+```{r}
+#| code-fold: true
+
+## Distribution of operating physician
+
+op_phys_df <- as.data.frame(prop.table(table(claims[["operating_phys_id"]])) * 100)
+
+## Updating operating_phys_id. NA --> 0, other --> 1
+
+claims <- claims %>%
+  mutate(operating_phys_id = ifelse(operating_phys_id == "NULL", 0, 1))
+
+```
+
+**Remove columns with only one unique value.**
+
+Variables that only have one unique value will cause errors when modeling, and won't be able to provide extra information about how each claim is different than another.
+
+```{r}
+#| code-fold: true
+
+claims <- claims %>%
+  select(where(~ n_distinct(.) > 1))
+
+```
+
+**Lag Days**
+
+Introducing a variable that contains the number of days between a patient's visit and the date the claim is sent to Anthem. Then, removing the statement_from_date and file_creation_date variables. The Naive Bayes model would not predict with date variables, so the lag days variable and the lubridate metrics created will account for both variables.
+
+https://stats.stackexchange.com/questions/200691/can-i-use-date-and-time-in-a-linear-model-in-r
+
+```{r}
+#| code-fold: true
+
+## Lag Days
+
+claims$lag_days <- as.numeric(claims$file_creation_date - claims$statement_from_date)
+
+## Dropping the date columns
+
+claims <- claims[,-which(names(claims) %in% c("file_creation_date","statement_from_date"))]
+
+```
+
+Other row removals and reasons below:
+
+```{r}
+
+## Claims will exclude any ins_cd that appear less than 5 times, predictions can't be made if certain ins_cds don't appear in the training set but appear in the testing set. (factor x has new levels VALUE) error
+
+ins_cd_tbl <- table(claims$ins_cd)
+
+claims <- claims[claims$ins_cd %in% names(ins_cd_tbl[ins_cd_tbl >= 5]), ]
+
+## Claim_filing_indicator code value of CH not defined because of singularities in logistic regression. NA given for estimate, std. error, z value, and Pr(>|z|).
+
+claims <- claims %>%
+  filter(claim_filing_indicator_code != "CH")
+
+## Claims will exclude any frequency_code that appear less than 20 times (3 values).
+
+frequency_code_tbl <- table(claims$frequency_code)
+
+claims <- claims[claims$frequency_code %in% names(frequency_code_tbl[frequency_code_tbl >= 20]), ]
+
+## Claims will exclude any admission_source_code that appear less than 20 times (3 values).
+
+admission_source_code_tbl <- table(claims$admission_source_code)
+
+claims <- claims[claims$admission_source_code %in% names(admission_source_code_tbl[admission_source_code_tbl >= 20]), ]
+
+```
+
+## Modeling
+
+Splitting the data into 70% training and 30% testing subsets via random sampling.
+
+```{r}
+
+## 70% training 30% testing
+
+set.seed(179)
+claims_rows = length(claims$claim_status)
+flag = sample(1:claims_rows, claims_rows*0.3, replace = FALSE)
+training = claims[-flag,]
+testing = claims[flag,]
+
+## True y values for the training and testing sets
+
+true_training_claim_status <- training$claim_status
+true_testing_claim_status <- testing$claim_status
+
+```
+
+Distribution of claim_status in the training and testing sets.
+
+```{r}
+#| code-fold: true
+
+prop.table(table(training$claim_status))
+
+prop.table(table(testing$claim_status))
+
+```
+
+### Logistic Regression
+
+Logistic regression estimates the probability of an event occurring. In this case, the probability that a claim will be approved or denied.
+
+An initial attempt at modeling was done before removing infrequently occurring revenue/procedure codes and other variables with only one value. This proved unsuccessful, so that's why those changes were made during the data cleaning.
+
+Other variables that decreased model run time by removal were info_code, subscriber_zip, and subscriber_gender.
+
+https://www.statology.org/contrasts-applied-to-factors-with-2-or-more-levels/
+
+Below is a simple logistic regression model being created using the training data:
+
+```{r}
+
+## Model start time
+
+start_logreg <- Sys.time()
+
+## Logistic Regression Model
+
+logreg <- glm(claim_status ~., data = training, family = binomial) 
+# family = poisson: have to update approved vs. denied to 0 and 1
+
+## Model end time
+
+end_logreg <- Sys.time()
+
+## Total time taken for the model to run
+
+time_logreg <- round(end_logreg - start_logreg, 2)
+
+time_logreg
+
+```
+
+#### Logistic Regression Model Summary
+
+```{r}
+summary(logreg)
+```
+
+```{r}
+modelsummary(list("Logistic Regression" = logreg))
+```
+
+```{r}
+
+## Testing error - Logistic Regression
+
+logreg_error_df <- as.data.frame(true_testing_claim_status)
+
+logreg_error_df <- logreg_error_df %>%
+  rename(true_claim_status = true_testing_claim_status) %>%                     
+  mutate(model_prob = predict(logreg, testing[,2:38], type = "response"),
+         model_pred = 1*(model_prob > .90) + 0,
+         claim_status_binary = 1*(true_claim_status == "Denied") + 0,
+         accurate = 1*(model_pred == claim_status_binary))
+
+sum(logreg_error_df$accurate) / nrow(logreg_error_df)
+
+table(logreg_error_df$true_claim_status)
+table(logreg_error_df$claim_status_binary)
+table(logreg_error_df$model_pred)
+
+```
+
+15% denial prediction success rate. No good.
+
+#### Feature Selection
+
+```{r}
+
+# varImp_logreg <- varImp(logreg)
+
+# varImp_logreg <- cbind(variable = rownames(varImp_logreg), varImp_logreg)
+# rownames(varImp_logreg) <- 1:nrow(varImp_logreg)
+
+# high varImp means correlated to outcome, but shouldn't remove low values
+
+V <- varImp(logreg)
+
+# V_high <- V %>%
+#   top_n(10, Overall)
+# 
+# V_low <- V %>%
+#   top_n(-10, Overall)
+# 
+# V <- union_all(V_high, V_low)
+
+V <- V %>%
+  top_n(15, Overall)
+
+ggplot2::ggplot(V, aes(x=reorder(rownames(V),Overall), y=Overall)) +
+  geom_point( color="blue", size=4, alpha=0.6) +
+  geom_segment( aes(x=rownames(V), xend=rownames(V), y=0, yend=Overall), color='skyblue') +
+  xlab("Variable") +
+  ylab("Overall Importance") +
+  theme_minimal() +
+  coord_flip() +
+  ggtitle("Top 15 Variable Importance") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+keep vars with GVIF less than 5?
+
+for continuous vars, VIF = GVIF. for categorical, df is the number of dummy vars associated with the variable
+
+```{r}
+
+vif(logreg)
+
+```
+
+```{r}
+
+# Checking for singularity: when predictors in a glm model have an exact linear relationship
+
+cors <- cor(select_if(training, is.numeric))
+
+```
+
+### Logistic Regression Reduced
+
+```{r}
+
+
+claimsv2 <- claims[,-which(names(claims) %in% c("claim_filing_indicator_code", "day_sent"))]
+
+
+## 70% training 30% testing
+
+set.seed(179)
+claims_rows = length(claimsv2$claim_status)
+flag = sample(1:claims_rows, claims_rows*0.3, replace = FALSE)
+training = claimsv2[-flag,]
+testing = claimsv2[flag,]
+
+## True y values for the training and testing sets
+
+true_training_claim_status <- training$claim_status
+true_testing_claim_status <- testing$claim_status
+
+```
+
+```{r}
+
+## Model start time
+
+start_logregv2 <- Sys.time()
+
+## Logistic Regression Model
+
+logregv2 <- glm(claim_status ~., data = training, family = binomial) 
+
+## Model end time
+
+end_logregv2 <- Sys.time()
+
+## Total time taken for the model to run
+
+time_logregv2 <- round(end_logregv2 - start_logregv2, 2)
+
+time_logregv2
+
+```
+
+```{r}
+modelsummary(list("Logistic Regression" = logregv2))
+```
+
+```{r}
+summary(logregv2)
+```
+
+```{r}
+
+## Testing error - Logistic Regression
+
+logreg_error_df <- as.data.frame(true_testing_claim_status)
+
+logreg_error_df <- logreg_error_df %>%
+  rename(true_claim_status = true_testing_claim_status) %>%                     
+  mutate(model_prob = predict(logregv2, testing[,2:36], type = "response"),
+         model_pred = 1*(model_prob > .90) + 0,
+         claim_status_binary = 1*(true_claim_status == "Denied") + 0,
+         accurate = 1*(model_pred == claim_status_binary))
+
+sum(logreg_error_df$accurate) / nrow(logreg_error_df)
+
+table(logreg_error_df$true_claim_status)
+table(logreg_error_df$claim_status_binary)
+table(logreg_error_df$model_pred)
+
+```
+
+### Naive Bayes
+
+The Naive Bayes classifier calculates the conditional probability of a class based on prior knowledge gained during training. However, a key note is that the Naive Bayes classifier assumes that each observation is independent of one another. Naive Bayes was chosen because it would be interesting to see if there was a noticeable change in accuracy due to the fact that each observation would be deemed as independent.
+
+```{r}
+
+## Model start time
+
+start_nb <- Sys.time()
+
+## Naive Bayes Model
+
+nb <- naivebayes::naive_bayes(claim_status ~., data = training, laplace = 1)
+
+## Model end time
+
+end_nb <- Sys.time()
+
+## Total time taken for the model to run
+
+time_nb <- round(end_nb - start_nb, 2)
+time_nb
+
+```
+
+```{r}
+
+## Testing Error - Naive Bayes
+
+nb_pred <- predict(nb, testing[,2:36], type = "class")
+
+table_nb <- table(nb_pred, true_testing_claim_status, dnn = c("pred", "actual"))
+
+confusionMatrix(table_nb)
+
+```
+
+```{r}
+summary(nb)
+```
+
+```{r}
+nb
+```
+
+```{r}
+# saveRDS(logreg_model)
+# readRDS("C:/Users/cdelaney/OneDrive - stonybrookmedicine/Documents/lm_output")
+```
+
+
+```{r}
+
+modelsummary(list("Logistic Regression" = logregv2))
+
+```
