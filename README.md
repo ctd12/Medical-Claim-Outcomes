@@ -15,3 +15,4 @@ A predictive analysis focused on predicting the outcome of medical claim denials
 
 **Report and Analysis**
 * Report.pdf
+* Report was created using Overleaf, and online LaTeX editor.
